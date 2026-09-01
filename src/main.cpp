@@ -11,7 +11,12 @@ uint8_t readRegister(uint8_t deviceAddr, uint8_t reg) {
   while (!Wire.available());
   return Wire.read();
 }
-
+void writeRegister(uint8_t deviceAddr, uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(deviceAddr);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission(true); // true to send a stop
+}
 void setup() {
   Wire.begin();
   Serial.begin(115200);
@@ -20,6 +25,11 @@ void setup() {
   uint8_t whoAmI = readRegister(MPU6050_ADDR_AD0_LOW, REG_WHO_AM_I);
   Serial.print("WHO_AM_I: 0x");
   Serial.println(whoAmI, HEX);
+
+  writeRegister(MPU6050_ADDR_AD0_LOW, REG_PWR_MGMT_1, 0x00);
+  uint8_t pwrMgmt = readRegister(MPU6050_ADDR_AD0_LOW, REG_PWR_MGMT_1);
+  Serial.print("PWR_MGMT_1: 0x");
+  Serial.println(pwrMgmt, HEX);
 }
 
 void loop() {}
