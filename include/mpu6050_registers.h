@@ -25,4 +25,9 @@ constexpr uint8_t SENSOR_DATA_LENGTH = 14; // bytes, covers accel+temp+gyro
 constexpr uint8_t REG_GYRO_CONFIG  = 0x1B;
 constexpr uint8_t REG_ACCEL_CONFIG = 0x1C;
 
+// Sensitivity values for default power-on ranges
+// Accel default: ±2g → 16384 LSB/g
+// Gyro default: ±250°/s → 131 LSB/(°/s)
+constexpr float ACCEL_SENSITIVITY_DEFAULT = 16384.0;
+constexpr float GYRO_SENSITIVITY_DEFAULT = 131.0;
 #endif

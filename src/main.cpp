@@ -42,6 +42,32 @@ bool readBytes(uint8_t deviceAddr, uint8_t startReg, uint8_t* buffer, uint8_t co
   }
   return true;
 }
+void calibrateGyro(float* biasX, float* biasY, float* biasZ) {
+  const int numSamples = 1000;
+  int32_t sumX = 0, sumY = 0, sumZ = 0;
+  int successfulReads = 0;
+  for (int i = 0; i < numSamples; i++) {
+    uint8_t buffer[14];
+    bool readOk = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
+    if (!readOk) continue;
+      
+    int16_t gyroX = (int16_t)((buffer[8] << 8) | buffer[9]);
+    int16_t gyroY = (int16_t)((buffer[10] << 8) | buffer[11]);
+    int16_t gyroZ = (int16_t)((buffer[12] << 8) | buffer[13]);
+
+    sumX += gyroX;
+    sumY += gyroY;
+    sumZ += gyroZ;
+    successfulReads++;
+    delay(1); // small delay to avoid overwhelming the sensor
+  }
+  const float SENSITIVITY = GYRO_SENSITIVITY_DEFAULT;
+
+  *biasX = (sumX / (float)successfulReads)/SENSITIVITY;
+  *biasY = (sumY / (float)successfulReads)/SENSITIVITY;
+  *biasZ = (sumZ / (float)successfulReads)/SENSITIVITY;
+}
+
 
 void setup() {
   Wire.begin();
@@ -105,13 +131,43 @@ void setup() {
     Serial.print("GYRO_Y_SIGNED: ");  Serial.println(gyroY_signed);
     Serial.print("GYRO_Z_SIGNED: ");  Serial.println(gyroZ_signed);
 
-    float accelX_g = accelX_signed / 16384.0;
-    float accelY_g = accelY_signed / 16384.0;
-    float accelZ_g = accelZ_signed / 16384.0;
+    float accelX_g = accelX_signed / ACCEL_SENSITIVITY_DEFAULT;
+    float accelY_g = accelY_signed / ACCEL_SENSITIVITY_DEFAULT;
+    float accelZ_g = accelZ_signed / ACCEL_SENSITIVITY_DEFAULT;
     float magnitude = sqrt(accelX_g * accelX_g + accelY_g * accelY_g + accelZ_g * accelZ_g);
     Serial.print("MAGNITUDE (should be ~1.0g): ");
     Serial.println(magnitude, 3);
   }
-}
+  float biasX, biasY, biasZ;
+  calibrateGyro(&biasX, &biasY, &biasZ);
+  Serial.print("Gyro Bias X: "); Serial.println(biasX, 3);
+  Serial.print("Gyro Bias Y: "); Serial.println(biasY, 3);
+  Serial.print("Gyro Bias Z: "); Serial.println(biasZ, 3);
 
+// Take one more reading and apply the correction
+  uint8_t buffer2[14];
+  bool readOk2 = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer2, SENSOR_DATA_LENGTH);
+  if (readOk2) {
+    int16_t gyroX_signed = (int16_t)((buffer2[8] << 8) | buffer2[9]);
+    int16_t gyroY_signed = (int16_t)((buffer2[10] << 8) | buffer2[11]);
+    int16_t gyroZ_signed = (int16_t)((buffer2[12] << 8) | buffer2[13]);
+
+    float gyroX_dps_raw = gyroX_signed / GYRO_SENSITIVITY_DEFAULT;
+    float gyroY_dps_raw = gyroY_signed / GYRO_SENSITIVITY_DEFAULT;
+    float gyroZ_dps_raw = gyroZ_signed / GYRO_SENSITIVITY_DEFAULT;
+
+    float gyroX_dps_corrected = gyroX_dps_raw - biasX;
+    float gyroY_dps_corrected = gyroY_dps_raw - biasY;
+    float gyroZ_dps_corrected = gyroZ_dps_raw - biasZ;
+
+    Serial.print("Gyro X — raw: "); Serial.print(gyroX_dps_raw, 3);
+    Serial.print("  corrected: "); Serial.println(gyroX_dps_corrected, 3);
+
+    Serial.print("Gyro Y — raw: "); Serial.print(gyroY_dps_raw, 3);
+    Serial.print("  corrected: "); Serial.println(gyroY_dps_corrected, 3);
+
+    Serial.print("Gyro Z — raw: "); Serial.print(gyroZ_dps_raw, 3);
+    Serial.print("  corrected: "); Serial.println(gyroZ_dps_corrected, 3);
+}
+}
 void loop() {}
