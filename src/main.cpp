@@ -2,6 +2,10 @@
 #include <Wire.h>
 #include "mpu6050_registers.h"   // your header from Step 3
 
+unsigned long lastTime = 0;
+float pitch, roll;
+float biasX = 0.0, biasY = 0.0, biasZ = 0.0;
+
 bool readRegister(uint8_t deviceAddr, uint8_t reg, uint8_t* value) {
   Wire.beginTransmission(deviceAddr);
   Wire.write(reg);
@@ -67,6 +71,35 @@ void calibrateGyro(float* biasX, float* biasY, float* biasZ) {
   *biasY = (sumY / (float)successfulReads)/SENSITIVITY;
   *biasZ = (sumZ / (float)successfulReads)/SENSITIVITY;
 }
+  void captureAccelPosition(const char* label, int16_t* avgX, int16_t* avgY, int16_t* avgZ) {
+  const int N = 50;
+  int32_t sumX = 0, sumY = 0, sumZ = 0;
+
+  for (int i = 0; i < N; i++) {
+    uint8_t buffer[14];
+    bool ok = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
+    if (!ok) continue;
+
+    sumX += (int16_t)((buffer[0] << 8) | buffer[1]);
+    sumY += (int16_t)((buffer[2] << 8) | buffer[3]);
+    sumZ += (int16_t)((buffer[4] << 8) | buffer[5]);
+
+    delay(2);
+  }
+
+  *avgX = sumX / N;
+  *avgY = sumY / N;
+  *avgZ = sumZ / N;
+
+  Serial.print(label);
+  Serial.print(" — X: "); Serial.print(*avgX);
+  Serial.print(" ("); Serial.print(*avgX / ACCEL_SENSITIVITY_DEFAULT, 3); Serial.print("g)");
+  Serial.print("  Y: "); Serial.print(*avgY);
+  Serial.print(" ("); Serial.print(*avgY / ACCEL_SENSITIVITY_DEFAULT, 3); Serial.print("g)");
+  Serial.print("  Z: "); Serial.print(*avgZ);
+  Serial.print(" ("); Serial.print(*avgZ / ACCEL_SENSITIVITY_DEFAULT, 3); Serial.println("g)"); 
+}
+
 
 
 void setup() {
@@ -131,14 +164,14 @@ void setup() {
     Serial.print("GYRO_Y_SIGNED: ");  Serial.println(gyroY_signed);
     Serial.print("GYRO_Z_SIGNED: ");  Serial.println(gyroZ_signed);
 
-    float accelX_g = accelX_signed / ACCEL_SENSITIVITY_DEFAULT;
-    float accelY_g = accelY_signed / ACCEL_SENSITIVITY_DEFAULT;
-    float accelZ_g = accelZ_signed / ACCEL_SENSITIVITY_DEFAULT;
-    float magnitude = sqrt(accelX_g * accelX_g + accelY_g * accelY_g + accelZ_g * accelZ_g);
-    Serial.print("MAGNITUDE (should be ~1.0g): ");
+    float accelX_g = (accelX_signed - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
+    float accelY_g = (accelY_signed - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
+    float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
+    float magnitude = sqrt(accelX_g*accelX_g + accelY_g*accelY_g + accelZ_g*accelZ_g);
+
+    Serial.print("MAGNITUDE (calibrated, should be ~1.0g): ");
     Serial.println(magnitude, 3);
   }
-  float biasX, biasY, biasZ;
   calibrateGyro(&biasX, &biasY, &biasZ);
   Serial.print("Gyro Bias X: "); Serial.println(biasX, 3);
   Serial.print("Gyro Bias Y: "); Serial.println(biasY, 3);
@@ -169,5 +202,53 @@ void setup() {
     Serial.print("Gyro Z — raw: "); Serial.print(gyroZ_dps_raw, 3);
     Serial.print("  corrected: "); Serial.println(gyroZ_dps_corrected, 3);
 }
+  int16_t x1, y1, z1;
+  captureAccelPosition("side (x up)", &x1, &y1, &z1);
+
+  lastTime = millis();
 }
-void loop() {}
+void loop() {
+
+  unsigned long now = millis();
+  unsigned long dt_ms = now - lastTime;
+  float dt = dt_ms / 1000.0; // convert to seconds
+  lastTime = now;
+  
+  uint8_t buffer[14];
+  bool ok = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
+
+  if (!ok) {
+    Serial.println("Sensor read failed, skipping this cycle");
+    return;
+  }
+  int16_t accelX_signed = (int16_t)((buffer[0] << 8) | buffer[1]);
+  int16_t accelY_signed = (int16_t)((buffer[2] << 8) | buffer[3]);
+  int16_t accelZ_signed = (int16_t)((buffer[4] << 8) | buffer[5]);
+  int16_t gyroX_signed  = (int16_t)((buffer[8] << 8) | buffer[9]);
+  int16_t gyroY_signed  = (int16_t)((buffer[10] << 8) | buffer[11]);
+  
+  float accelX_g = (accelX_signed - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
+  float accelY_g = (accelY_signed - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
+  float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
+  float gyroX_dps = (gyroX_signed / GYRO_SENSITIVITY_DEFAULT) - biasX;
+  float gyroY_dps = (gyroY_signed / GYRO_SENSITIVITY_DEFAULT) - biasY;
+
+  float pitch_accel = atan2(accelY_g, accelZ_g) * 180.0 / PI;
+
+  float pitch_gyro = pitch + gyroX_dps * dt;
+
+  const float alpha = 0.98; // complementary filter coefficient
+  pitch = alpha * pitch_gyro + (1 - alpha) * pitch_accel;
+
+  Serial.print("Pitch: "); 
+  Serial.println(pitch, 2);
+  
+  float roll_accel = atan2(accelX_g, accelZ_g) * 180.0 / PI;
+  float roll_gyro = roll + gyroY_dps * dt;
+  roll = alpha * roll_gyro + (1 - alpha) * roll_accel;
+
+  Serial.print("Roll: "); 
+  Serial.println(roll, 2);
+
+  delay(10);
+}

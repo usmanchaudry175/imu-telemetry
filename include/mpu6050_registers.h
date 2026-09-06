@@ -30,4 +30,14 @@ constexpr uint8_t REG_ACCEL_CONFIG = 0x1C;
 // Gyro default: ±250°/s → 131 LSB/(°/s)
 constexpr float ACCEL_SENSITIVITY_DEFAULT = 16384.0;
 constexpr float GYRO_SENSITIVITY_DEFAULT = 131.0;
+
+// Accelerometer calibration — 6-position method, [02/09/2026]
+// See docs/calibration.md for raw capture data
+constexpr float ACCEL_OFFSET_X = 671.5;
+constexpr float ACCEL_OFFSET_Y = 16.0;
+constexpr float ACCEL_OFFSET_Z = -1252.0;
+
+constexpr float ACCEL_SCALE_X = 16281.5;
+constexpr float ACCEL_SCALE_Y = 16263.0;
+constexpr float ACCEL_SCALE_Z = 16667.0;
 #endif
