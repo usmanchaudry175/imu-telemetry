@@ -6,6 +6,32 @@ unsigned long lastTime = 0;
 float pitch, roll;
 float biasX = 0.0, biasY = 0.0, biasZ = 0.0;
 
+volatile bool sampleReady = false;
+volatile uint32_t interruptCount = 0;
+
+uint32_t lastSampleTime = 0;
+uint32_t maxJitter = 0;
+uint32_t minGap = 999999;
+uint32_t maxGap = 0;
+uint32_t sampleCount = 0;
+uint32_t maxReadDuration = 0;
+
+ISR(TIMER1_COMPA_vect) {
+  sampleReady = true;
+  interruptCount++;
+}
+
+void setupTimer() {
+  noInterrupts();           // disable all interrupts
+  TCCR1A = 0;               // set entire TCCR1A register to 0
+  TCCR1B = 0;               // same for TCCR1B
+  TCNT1  = 0;               // initialize counter value to 0
+  OCR1A = 624;            // set compare match register for 1 Hz increments (16MHz/1024/1Hz - 1)
+  TCCR1B |= (1 << WGM12);   // turn on CTC mode
+  TCCR1B |= (1 << CS12); // Set CS12 and CS10 bits for 1024 prescaler
+  TIMSK1 |= (1 << OCIE1A);  // enable timer compare interrupt
+  interrupts();             // enable all interrupts
+}
 bool readRegister(uint8_t deviceAddr, uint8_t reg, uint8_t* value) {
   Wire.beginTransmission(deviceAddr);
   Wire.write(reg);
@@ -104,6 +130,7 @@ void calibrateGyro(float* biasX, float* biasY, float* biasZ) {
 
 void setup() {
   Wire.begin();
+  Wire.setClock(400000); // 400kHz I2C speed
   Serial.begin(115200);
   while (!Serial);
 
@@ -206,49 +233,90 @@ void setup() {
   captureAccelPosition("side (x up)", &x1, &y1, &z1);
 
   lastTime = millis();
+  setupTimer();
 }
 void loop() {
+  static uint32_t lastPrint = 0;
+  uint32_t nowMs = millis();
 
-  unsigned long now = millis();
-  unsigned long dt_ms = now - lastTime;
-  float dt = dt_ms / 1000.0; // convert to seconds
-  lastTime = now;
-  
-  uint8_t buffer[14];
-  bool ok = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
-
-  if (!ok) {
-    Serial.println("Sensor read failed, skipping this cycle");
-    return;
+  if (nowMs - lastPrint >= 1000) {
+    lastPrint = nowMs;
+    Serial.print("Interrupts in last second: ");
+    Serial.println(interruptCount);
+    Serial.print("Min gap: "); Serial.print(minGap);
+    Serial.print("ms  Max gap: "); Serial.print(maxGap);
+    Serial.print("ms  Max jitter: "); Serial.print(maxJitter);
+    Serial.println("ms");
+    Serial.print("Max read duration: "); Serial.print(maxReadDuration); Serial.println("us");
+    interruptCount = 0;
   }
-  int16_t accelX_signed = (int16_t)((buffer[0] << 8) | buffer[1]);
-  int16_t accelY_signed = (int16_t)((buffer[2] << 8) | buffer[3]);
-  int16_t accelZ_signed = (int16_t)((buffer[4] << 8) | buffer[5]);
-  int16_t gyroX_signed  = (int16_t)((buffer[8] << 8) | buffer[9]);
-  int16_t gyroY_signed  = (int16_t)((buffer[10] << 8) | buffer[11]);
+
+  if(sampleReady) {
+    sampleReady = false;
+    
+    uint32_t now = millis();
+    if (lastSampleTime != 0) {
+      uint32_t gap = now - lastSampleTime;
+      if (gap > maxGap) maxGap = gap;
+      if (gap < minGap) minGap = gap;
+
+      int32_t deviation = (int32_t)gap - 10;   // ideal gap is 10ms at 100Hz
+      uint32_t absDeviation = (deviation < 0) ? -deviation : deviation;
+      if (absDeviation > maxJitter) maxJitter = absDeviation;
+    }
+
+    lastSampleTime = now;
+    sampleCount++;
+
+    unsigned long dt_ms = now - lastTime;
+    float dt = dt_ms / 1000.0; // convert to seconds
+    lastTime = now;
   
-  float accelX_g = (accelX_signed - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
-  float accelY_g = (accelY_signed - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
-  float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
-  float gyroX_dps = (gyroX_signed / GYRO_SENSITIVITY_DEFAULT) - biasX;
-  float gyroY_dps = (gyroY_signed / GYRO_SENSITIVITY_DEFAULT) - biasY;
+    uint8_t buffer[14];
+    uint32_t readStart = micros();
+    bool ok = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
+    uint32_t readDuration = micros() - readStart;
 
-  float pitch_accel = atan2(accelY_g, accelZ_g) * 180.0 / PI;
+    if (readDuration > maxReadDuration) {
+      maxReadDuration = readDuration;
+    }
 
-  float pitch_gyro = pitch + gyroX_dps * dt;
+    if (!ok) {
+      Serial.println("Sensor read failed, skipping this cycle");
+      return;
+    }
 
-  const float alpha = 0.98; // complementary filter coefficient
-  pitch = alpha * pitch_gyro + (1 - alpha) * pitch_accel;
+    int16_t accelX_signed = (int16_t)((buffer[0] << 8) | buffer[1]);
+    int16_t accelY_signed = (int16_t)((buffer[2] << 8) | buffer[3]);
+    int16_t accelZ_signed = (int16_t)((buffer[4] << 8) | buffer[5]);
+    int16_t gyroX_signed  = (int16_t)((buffer[8] << 8) | buffer[9]);
+    int16_t gyroY_signed  = (int16_t)((buffer[10] << 8) | buffer[11]);
 
-  Serial.print("Pitch: "); 
-  Serial.println(pitch, 2);
-  
-  float roll_accel = atan2(accelX_g, accelZ_g) * 180.0 / PI;
-  float roll_gyro = roll + gyroY_dps * dt;
-  roll = alpha * roll_gyro + (1 - alpha) * roll_accel;
+    float accelX_g = (accelX_signed - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
+    float accelY_g = (accelY_signed - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
+    float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
+    float gyroX_dps = (gyroX_signed / GYRO_SENSITIVITY_DEFAULT) - biasX;
+    float gyroY_dps = (gyroY_signed / GYRO_SENSITIVITY_DEFAULT) - biasY;
 
-  Serial.print("Roll: "); 
-  Serial.println(roll, 2);
+    float pitch_accel = atan2(accelY_g, accelZ_g) * 180.0 / PI;
 
-  delay(10);
+    float pitch_gyro = pitch + gyroX_dps * dt;
+
+    const float alpha = 0.98; // complementary filter coefficient
+    pitch = alpha * pitch_gyro + (1 - alpha) * pitch_accel;
+    
+    float roll_accel = atan2(accelX_g, accelZ_g) * 180.0 / PI;
+    float roll_gyro = roll + gyroY_dps * dt;
+    roll = alpha * roll_gyro + (1 - alpha) * roll_accel;
+
+    static int printCounter = 0;
+    printCounter++;
+    if (printCounter >= 10) { // Print every 10 samples
+      printCounter = 0;
+      Serial.print("Pitch: "); Serial.println(pitch, 2);
+      Serial.print("Roll: ");  Serial.println(roll, 2);
+    }
+
+    delay(10);
+  }
 }
