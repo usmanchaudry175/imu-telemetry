@@ -9,6 +9,12 @@ float biasX = 0.0, biasY = 0.0, biasZ = 0.0;
 volatile bool sampleReady = false;
 volatile uint32_t interruptCount = 0;
 
+float kalmanAngle = 0;
+float kalmanUncertainty = 4;
+ 
+const float Q_angle = 0.0000013;   // measured from 62 stationary gyro samples, using Step 11's measured dt
+const float R_measure = 0.0379;   // measured from 121 stationary samples across 2 collection runs
+
 uint32_t lastSampleTime = 0;
 uint32_t maxJitter = 0;
 uint32_t minGap = 999999;
@@ -241,13 +247,14 @@ void loop() {
 
   if (nowMs - lastPrint >= 1000) {
     lastPrint = nowMs;
-    Serial.print("Interrupts in last second: ");
+    /*Serial.print("Interrupts in last second: ");
     Serial.println(interruptCount);
     Serial.print("Min gap: "); Serial.print(minGap);
     Serial.print("ms  Max gap: "); Serial.print(maxGap);
     Serial.print("ms  Max jitter: "); Serial.print(maxJitter);
     Serial.println("ms");
-    Serial.print("Max read duration: "); Serial.print(maxReadDuration); Serial.println("us");
+    /*Serial.print("Max read duration: "); Serial.print(maxReadDuration); Serial.println("us");
+    */
     interruptCount = 0;
   }
 
@@ -299,7 +306,6 @@ void loop() {
     float gyroY_dps = (gyroY_signed / GYRO_SENSITIVITY_DEFAULT) - biasY;
 
     float pitch_accel = atan2(accelY_g, accelZ_g) * 180.0 / PI;
-
     float pitch_gyro = pitch + gyroX_dps * dt;
 
     const float alpha = 0.98; // complementary filter coefficient
@@ -309,12 +315,18 @@ void loop() {
     float roll_gyro = roll + gyroY_dps * dt;
     roll = alpha * roll_gyro + (1 - alpha) * roll_accel;
 
+    kalmanAngle += gyroX_dps * dt;
+    kalmanUncertainty += Q_angle;
+    float kalmanGain = kalmanUncertainty / (kalmanUncertainty + R_measure);
+    kalmanAngle += kalmanGain * (pitch_accel - kalmanAngle);
+    kalmanUncertainty *= (1 - kalmanGain);
+
     static int printCounter = 0;
     printCounter++;
     if (printCounter >= 10) { // Print every 10 samples
       printCounter = 0;
-      Serial.print("Pitch: "); Serial.println(pitch, 2);
-      Serial.print("Roll: ");  Serial.println(roll, 2);
+      Serial.print("Pitch (comp): "); Serial.println(pitch, 2);
+      Serial.print("Kalman Angle: ");  Serial.println(kalmanAngle, 2);
     }
 
     delay(10);
