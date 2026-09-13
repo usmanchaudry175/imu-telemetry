@@ -208,28 +208,187 @@ down to 4µs, a result that also revealed a genuine limitation in the
 original hypothesis set (electrical connection quality had not been
 considered as a candidate variable).
 
-Ring buffer / overflow detection (Step 11, completed)
-Method: Replaced the single volatile bool sampleReady flag with a monotonic tick-counter queue (tickHead/tickTail, TICK_QUEUE_SIZE slots) between the timer ISR and the main loop. The ISR only records a tick's micros() timestamp and advances tickHead; all sensor reads and processing remain in loop(), drained via a while (tickTail != tickHead) loop rather than a single if, so a temporary stall doesn't silently lose samples — it processes the backlog on the next pass instead. Added an explicit missedSamples counter, incremented only when the queue is genuinely full (tickHead would collide with tickTail), to prove overflow behaviour rather than assume it — the single-flag design had no way to detect or report a missed sample at all.
-RAM constraint discovered during implementation: adding the tick-timestamp array and growing the per-sample log struct (queue_depth_at_read field) pushed RAM usage to 93% (1904/2048 bytes on the ATmega328P), causing sd.begin() to hang silently rather than fail cleanly — not an SD wiring or logic fault, but a stack/heap collision at the most stack-hungry call site in the sketch. Diagnosed via bisection (temporary DEBUG print statements narrowing the hang to inside a specific function call) before being traced to available RAM via the PlatformIO build report. Fixed by right-sizing queue_depth_at_read to uint8_t (previously oversized as uint32_t; value never exceeds queue capacity) and reducing both TICK_QUEUE_SIZE and BUFFER_SIZE from 8 to 4.
-Overflow root-cause investigation (methodical elimination, same standard as the Step 11 jitter investigation above): the reduced TICK_QUEUE_SIZE=4 configuration showed a real, steadily-climbing overflow — missedSamples reached 18 over one ~3-5 minute run, confirmed climbing (not a one-time startup transient) via repeated live serial monitoring.
-1.	Hypothesis: periodic serial debug print block (5 print statements every 10th sample) blocking the loop long enough to cause backlog. Test: disabled the print block entirely, reran with only a lightweight 5-second missedSamples printout. Result: still climbed (1→2→3→5 over the same window). Ruled out.
-2.	Hypothesis: SD flush latency under sustained write load. Test: disabled the SD write call inside logSample() entirely (kept everything else identical). Result: missedSamples held at 0 throughout a full run. Confirmed as the cause.
-Conclusion: SD flush latency, not I2C or print overhead, was the root cause. This contradicts an earlier isolated single-write latency estimate of ~1.3ms (calculated from SD_SCK_MHZ(1) transfer time against the 80ms flush interval at BUFFER_SIZE=8). The discrepancy is attributed to SD flash controllers exhibiting occasional latency spikes from internal wear-leveling/block-management under sustained continuous writing — a well-documented flash-storage behaviour not visible in a single isolated measurement, the same category of lesson as the earlier header-pin vs. direct-wire connection finding (a careful measurement can still miss a real variable if that variable was never part of the original test's conditions).
-Fix and verification: restored TICK_QUEUE_SIZE to 8 (accepting the RAM cost) while keeping BUFFER_SIZE at 4 and the uint8_t queue_depth_at_read fix, re-enabled real SD writes, and reran the same isolation test. Result: 0 missed samples confirmed over a sustained run with SD writes fully active.
-Steady-state characterisation (26,943-sample run, 269.4s, post-reset-settling — see reset note below): queue depth never exceeded 4 of the 8 available slots at any point. 73.2% of samples were serviced with zero backlog (depth=1); 26.8% showed shallow catch-up backlog (depth 2–4), none reaching true capacity.
-Known limitation — jitter percentile precision: the logged timestamp_us reflects the time of sensor-read/processing (micros() called in loop()), not the ISR's originally-recorded tick timestamp (tickTime, captured but not currently logged). A sample immediately following a catch-up burst can show an artificially short measured interval even when correctly classified as "clean" (queue_depth==1) at the moment it was read, because the interval is measured against processing time, not true tick time. This means computed jitter percentiles are a lower bound on true jitter, not an exact figure. Fixing this would require logging tickTime instead of processing-time now — deferred given time constraints against placement deadlines; documented here as an open limitation rather than a resolved one, per this project's stated convention of logging known limitations honestly (see complementary filter yaw/roll-wraparound entries above for the same practice).
-Separately observed — early-boot reset cluster: 5 reset events occurred during the 26,943-sample verification run, all clustered within the first ~5.5 seconds (record indices 264, 384, 468, 512, 552 of 27,496 total), none afterward across the remaining ~265 seconds. Pattern (isolated to startup, absent thereafter) is consistent with a brownout reset caused by SD card initialization's current draw briefly sagging the supply rail, rather than an ongoing stability fault — not yet independently confirmed via the ATmega328P's MCUSR reset-cause register, which would give a definitive answer (brown-out vs. watchdog vs. external vs. power-on reset) but requires reading MCUSR at the very start of setup() before the bootloader clears it. Logged as a probable-but-unconfirmed explanation.
-Headline claim: Implemented and empirically validated a lock-free tick-queue between the sample-rate ISR and main loop, replacing a single-flag design with zero overflow visibility. Diagnosed a genuine overflow condition through systematic isolation (ruling out print overhead before confirming SD flush latency as the cause), a result that corrected an earlier single-measurement latency estimate by revealing SD flash controllers' sustained-write latency tail. Verified the fixed configuration held zero true overflow across a 27,000-sample, 4.5-minute run, with confirmed real headroom (queue depth peaking at 4 of 8 available slots).
+## Ring buffer / overflow detection (Step 11, completed)
 
-SD card logging (Step 12, partial — logging complete, framed wire protocol deferred to blackbox Phase 8)
-Method: SdFat32 over SPI (CS on pin 10, standard Arduino hardware SPI pins 11/12/13 for MOSI/MISO/SCK), writing buffered ImuSample structs (packed, 21 bytes as of the Step 11 ring-buffer update) to imu_log.bin in append mode. Buffered writes (BUFFER_SIZE=4 samples per flush) with logFile.sync() confirming each flush and an sdWriteFailures counter reporting (not silently swallowing) any write/sync failure — same "flag reality, don't silently normalize" principle already established in the software companion project's design decisions (D16, D18).
-Hardware note: original SD card (an off-brand "Onyx" microSD) was root-caused as unreliable — inconsistent SPI timing/write behaviour under embedded use — and replaced with a SanDisk card before this work began.
-Wiring verification: confirmed via multimeter continuity checks (every breakout-to-Arduino wire individually, VCC-to-GND short check) and a powered no-card voltage check at the breakout's regulator output, before ever inserting the card — deliberately sequenced to isolate wiring faults from card-related faults, and to avoid risking the card itself on unverified wiring.
-Result: SD initialization, buffered writes, and flushes confirmed reliable across multiple runs. Independent Python verification script (tools/verify_imu_log.py) decodes the raw struct format directly (struct.unpack, little-endian, matching the packed C struct exactly) and checks: file-size/record-size alignment, timestamp monotonicity, plausibility bounds on pitch/roll, and (post ring-buffer work) queue-depth distribution and steady-state jitter percentiles.
-Real bug found via verification — session boundary ambiguity: because logFile.open() uses O_CREAT | O_APPEND, every power-cycle appends to the same file rather than starting fresh, and micros() restarts near-zero on each boot. A verification run flagged a non-monotonic timestamp at record 168, which decoded to two concatenated sessions with no marker distinguishing them — a real, reproduced instance of exactly the problem the software companion project's session-ID design (D4, D9) exists to solve. Deliberately left unfixed in the current SD format (logged as a known limitation) since the real fix — a session ID + first-of-session flag per record — is already designed and will arrive with the Bluetooth link's upcoming reframing onto the full COBS/CRC wire protocol (Step 12's originally-planned "framed wire protocol: sync bytes, length, sequence number, payload, CRC" requirement, deferred to that phase rather than duplicated ad-hoc into the SD-only path).
-Known limitation — SD log format has no session markers: a power-cycle mid-testing silently concatenates two sessions into one file with a discoverable-but-not-flagged timestamp discontinuity. Confirmed real via the record-168 finding above. Will be resolved when the Bluetooth link adopts the full framed wire protocol (session ID, sequence numbers) rather than the current raw ImuSample struct.
-Headline claim: Implemented buffered, failure-reporting SD logging over SPI, independently verified via a from-scratch Python decoder (not just trusting the firmware's own output) that reproduced a real session-boundary bug — confirming, with real data rather than a theoretical concern, why the project's planned framed wire protocol (sequence numbers, session IDs) is a genuine requirement rather than unnecessary complexity for this application.
-Not yet done: framed wire protocol (COBS/CRC/sequence-number framing) for the Bluetooth link, replacing the current raw unframed ImuSample struct — deliberately sequenced after the software companion project's own protocol was independently designed and benchmarked (see that project's Phase 7 results), so the IMU firmware adopts an already-proven format rather than designing one from scratch under application-deadline time pressure.
+**Method:** Replaced the single `volatile bool sampleReady` flag with a
+monotonic tick-counter queue (`tickHead`/`tickTail`, `TICK_QUEUE_SIZE`
+slots) between the timer ISR and the main loop. The ISR only records a
+tick's `micros()` timestamp and advances `tickHead`; all sensor reads and
+processing remain in `loop()`, drained via a `while (tickTail != tickHead)`
+loop rather than a single `if`, so a temporary stall doesn't silently lose
+samples — it processes the backlog on the next pass instead. Added an
+explicit `missedSamples` counter, incremented only when the queue is
+genuinely full (`tickHead` would collide with `tickTail`), to prove
+overflow behaviour rather than assume it — the single-flag design had no
+way to detect or report a missed sample at all.
+
+**RAM constraint discovered during implementation:** adding the
+tick-timestamp array and growing the per-sample log struct
+(`queue_depth_at_read` field) pushed RAM usage to 93% (1904/2048 bytes on
+the ATmega328P), causing `sd.begin()` to hang silently rather than fail
+cleanly — not an SD wiring or logic fault, but a stack/heap collision at
+the most stack-hungry call site in the sketch. Diagnosed via bisection
+(temporary DEBUG print statements narrowing the hang to inside a specific
+function call) before being traced to available RAM via the PlatformIO
+build report. Fixed by right-sizing `queue_depth_at_read` to `uint8_t`
+(previously oversized as `uint32_t`; value never exceeds queue capacity)
+and reducing both `TICK_QUEUE_SIZE` and `BUFFER_SIZE` from 8 to 4.
+
+**Overflow root-cause investigation** (methodical elimination, same
+standard as the Step 11 jitter investigation above): the reduced
+`TICK_QUEUE_SIZE=4` configuration showed a real, steadily-climbing
+overflow — `missedSamples` reached 18 over one ~3-5 minute run, confirmed
+climbing (not a one-time startup transient) via repeated live serial
+monitoring.
+
+1. **Hypothesis:** periodic serial debug print block (5 print statements
+   every 10th sample) blocking the loop long enough to cause backlog.
+   **Test:** disabled the print block entirely, reran with only a
+   lightweight 5-second `missedSamples` printout. **Result:** still climbed
+   (1→2→3→5 over the same window). Ruled out.
+2. **Hypothesis:** SD flush latency under sustained write load. **Test:**
+   disabled the SD write call inside `logSample()` entirely (kept
+   everything else identical). **Result:** `missedSamples` held at 0
+   throughout a full run. Confirmed as the cause.
+
+**Conclusion:** SD flush latency, not I2C or print overhead, was the root
+cause. This contradicts an earlier isolated single-write latency estimate
+of ~1.3ms (calculated from `SD_SCK_MHZ(1)` transfer time against the 80ms
+flush interval at `BUFFER_SIZE=8`). The discrepancy is attributed to SD
+flash controllers exhibiting occasional latency spikes from internal
+wear-leveling/block-management under sustained continuous writing — a
+well-documented flash-storage behaviour not visible in a single isolated
+measurement, the same category of lesson as the earlier header-pin vs.
+direct-wire connection finding (a careful measurement can still miss a
+real variable if that variable was never part of the original test's
+conditions).
+
+**Fix and verification:** restored `TICK_QUEUE_SIZE` to 8 (accepting the
+RAM cost) while keeping `BUFFER_SIZE` at 4 and the `uint8_t`
+`queue_depth_at_read` fix, re-enabled real SD writes, and reran the same
+isolation test. Result: 0 missed samples confirmed over a sustained run
+with SD writes fully active.
+
+**Steady-state characterisation** (26,943-sample run, 269.4s,
+post-reset-settling — see reset note below): queue depth never exceeded 4
+of the 8 available slots at any point. 73.2% of samples were serviced with
+zero backlog (depth=1); 26.8% showed shallow catch-up backlog (depth 2–4),
+none reaching true capacity.
+
+**Jitter percentiles** from the same run, split by queue depth at read
+time: clean samples (depth=1, 73.2%) measured p50 6,512µs, p99 10,000µs,
+p99.9 17,112µs; catch-up samples (depth 2–4, 26.8%) measured p50 21,964µs,
+p99 33,168µs. As noted below, these are processing-time intervals, not
+true ISR-tick jitter, so they are a lower bound on the real figure.
+
+**Known limitation — jitter percentile precision:** the logged
+`timestamp_us` reflects the time of sensor-read/processing (`micros()`
+called in `loop()`), not the ISR's originally-recorded tick timestamp
+(`tickTime`, captured but not currently logged). A sample immediately
+following a catch-up burst can show an artificially short measured
+interval even when correctly classified as "clean" (`queue_depth==1`) at
+the moment it was read, because the interval is measured against
+processing time, not true tick time. This means computed jitter
+percentiles are a lower bound on true jitter, not an exact figure. Fixing
+this would require logging `tickTime` instead of processing-time now —
+deferred given time constraints against placement deadlines; documented
+here as an open limitation rather than a resolved one, per this project's
+stated convention of logging known limitations honestly (see complementary
+filter yaw/roll-wraparound entries above for the same practice).
+
+**Separately observed — early-boot reset cluster:** 5 reset events
+occurred during the 26,943-sample verification run, all clustered within
+the first ~5.5 seconds (record indices 264, 384, 468, 512, 552 of 27,496
+total), none afterward across the remaining ~265 seconds. Pattern
+(isolated to startup, absent thereafter) is consistent with a brownout
+reset caused by SD card initialization's current draw briefly sagging the
+supply rail, rather than an ongoing stability fault — not yet
+independently confirmed via the ATmega328P's MCUSR reset-cause register,
+which would give a definitive answer (brown-out vs. watchdog vs. external
+vs. power-on reset) but requires reading MCUSR at the very start of
+`setup()` before the bootloader clears it. Logged as a
+probable-but-unconfirmed explanation.
+
+**Headline claim:** Implemented and empirically validated a lock-free
+tick-queue between the sample-rate ISR and main loop, replacing a
+single-flag design with zero overflow visibility. Diagnosed a genuine
+overflow condition through systematic isolation (ruling out print overhead
+before confirming SD flush latency as the cause), a result that corrected
+an earlier single-measurement latency estimate by revealing SD flash
+controllers' sustained-write latency tail. Verified the fixed
+configuration held zero true overflow across a 27,000-sample, 4.5-minute
+run, with confirmed real headroom (queue depth peaking at 4 of 8 available
+slots).
+
+---
+
+## SD card logging (Step 12, partial)
+
+**Status:** logging complete; framed wire protocol deferred to Blackbox Phase 8.
+
+**Method:** SdFat32 over SPI (CS on pin 10, standard Arduino hardware SPI
+pins 11/12/13 for MOSI/MISO/SCK), writing buffered `ImuSample` structs
+(packed, 21 bytes as of the Step 11 ring-buffer update) to `imu_log.bin` in
+append mode. Buffered writes (`BUFFER_SIZE=4` samples per flush) with
+`logFile.sync()` confirming each flush and an `sdWriteFailures` counter
+reporting (not silently swallowing) any write/sync failure — same "flag
+reality, don't silently normalize" principle already established in the
+software companion project's design decisions (D16, D18).
+
+**Hardware note:** original SD card (an off-brand "Onyx" microSD) was
+root-caused as unreliable — inconsistent SPI timing/write behaviour under
+embedded use — and replaced with a SanDisk card before this work began.
+
+**Wiring verification:** confirmed via multimeter continuity checks (every
+breakout-to-Arduino wire individually, VCC-to-GND short check) and a
+powered no-card voltage check at the breakout's regulator output, before
+ever inserting the card — deliberately sequenced to isolate wiring faults
+from card-related faults, and to avoid risking the card itself on
+unverified wiring.
+
+**Result:** SD initialization, buffered writes, and flushes confirmed
+reliable across multiple runs. Independent Python verification script
+(`tools/verify_imu_log.py`) decodes the raw struct format directly
+(`struct.unpack`, little-endian, matching the packed C struct exactly) and
+checks: file-size/record-size alignment, timestamp monotonicity,
+plausibility bounds on pitch/roll, and (post ring-buffer work) queue-depth
+distribution and steady-state jitter percentiles.
+
+**Real bug found via verification — session boundary ambiguity:** because
+`logFile.open()` uses `O_CREAT | O_APPEND`, every power-cycle appends to
+the same file rather than starting fresh, and `micros()` restarts
+near-zero on each boot. A verification run flagged a non-monotonic
+timestamp at record 168, which decoded to two concatenated sessions with
+no marker distinguishing them — a real, reproduced instance of exactly the
+problem the software companion project's session-ID design (D4, D9) exists
+to solve. Deliberately left unfixed in the current SD format (logged as a
+known limitation) since the real fix — a session ID + first-of-session
+flag per record — is already designed and will arrive with the Bluetooth
+link's upcoming reframing onto the full COBS/CRC wire protocol.
+
+**Known limitation — SD log format has no session markers:** a
+power-cycle mid-testing silently concatenates two sessions into one file
+with a discoverable-but-not-flagged timestamp discontinuity. Confirmed
+real via the record-168 finding above. Will be resolved when the
+Bluetooth link adopts the full framed wire protocol (session ID, sequence
+numbers) rather than the current raw `ImuSample` struct.
+
+**Headline claim:** Implemented buffered, failure-reporting SD logging
+over SPI, independently verified via a from-scratch Python decoder (not
+just trusting the firmware's own output) that reproduced a real
+session-boundary bug — confirming, with real data rather than a
+theoretical concern, why the project's planned framed wire protocol
+(sequence numbers, session IDs) is a genuine requirement rather than
+unnecessary complexity for this application.
+
+**Not yet done:** framed wire protocol (COBS/CRC/sequence-number framing)
+for the Bluetooth link, replacing the current raw unframed `ImuSample`
+struct — deliberately sequenced after the software companion project's own
+protocol was independently designed and benchmarked (see that project's
+Phase 7 results), so the IMU firmware adopts an already-proven format
+rather than designing one from scratch under application-deadline time
+pressure.
+
 ---
 
 ## Kalman filter (bonus, beyond original plan)
@@ -320,4 +479,3 @@ planned for Step 12 (logging/telemetry) and Step 15 (CAN bus)
 respectively.
 
 ---
-
