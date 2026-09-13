@@ -1,11 +1,5 @@
-# IMU Project — Measured Results & CV Claims Log
+# IMU Project — Measured Results
 
-Running record of every verified, measured result from this project. Only add a claim
-here once it's been genuinely tested — this file is the single source of truth for
-CV wording, README content, and interview prep. Never state a number here that
-hasn't been observed and confirmed.
-
----
 
 ## Gyroscope calibration (Step 9)
 
@@ -432,13 +426,6 @@ new learning versus time — noted as an honest scope boundary.
 ---
 
 ## Hardware setup — new components (in progress)
-
-**Wiring quality fix (session-wide):** all original components (MPU-6050,
-first magnetometer attempt) were bare-hole, unsoldered, direct-wired —
-identified as the root cause of the Step 11 timing anomaly (see above) and
-of the session's earlier intermittent-connection debugging. All remaining
-components (SD card, Bluetooth HC-05, MCP2515 CAN modules) arrive
-pre-soldered with proper header pins, avoiding a repeat of this issue.
 
 **Logic analyser:** confirmed hardware is a generic 24MHz 8-channel
 Cypress FX2-based clone (fx2lafw-compatible). Connected via USB-C to
