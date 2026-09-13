@@ -2,16 +2,25 @@
 #include <Wire.h>
 #include "mpu6050_registers.h"   // your header from Step 3
 #include <SoftwareSerial.h>
-//#include <SdFat.h>
+#include <SdFat.h>
 
 SoftwareSerial btSerial(2, 3); // RX, TX
+
+#define TICK_QUEUE_SIZE 8
+
+volatile uint8_t tickHead = 0;   // ISR writes here
+volatile uint8_t tickTail = 0;   // loop() reads here
+volatile uint32_t tickTimestamps[TICK_QUEUE_SIZE];  // micros() at each tick, for jitter analysis
+
+uint32_t missedSamples  = 0;
 
 struct __attribute__((packed)) ImuSample {
   uint32_t timestamp_us;
   int16_t ax, ay, az;      // raw sensor units
   int16_t gx, gy, gz;      // raw sensor units
   int16_t pitch_x100;      // pitch * 100, fixed-point (0.01° resolution)
-  int16_t roll_x100;       // roll * 100, fixed-point
+  int16_t roll_x100;
+  uint8_t queue_depth_at_read;       // roll * 100, fixed-point
 };
 uint8_t btDownsampleCounter = 0;
 const uint8_t BT_DOWNSAMPLE = 5; // send every 5th sample over Bluetooth
@@ -22,25 +31,29 @@ void sendTelemetryBT(uint32_t timestamp_us, int16_t ax, int16_t ay, int16_t az,
   ImuSample sample = {timestamp_us, ax, ay, az, gx, gy, gz, (int16_t)(pitch * 100), (int16_t)(roll * 100)};
   btSerial.write((uint8_t*)&sample, sizeof(sample));
 }
-/*#define CS_PIN 10
-#define BUFFER_SIZE 8
+#define CS_PIN 10
+#define BUFFER_SIZE 4
 SdFat32 sd;
 File32 logFile;
 ImuSample sampleBuffer[BUFFER_SIZE];
 volatile uint8_t bufferIndex = 0;
-*/
-/*void setupSD() {
-  pinMode(10, OUTPUT);
-  digitalWrite(10, HIGH);
 
-  Serial.println(F("Waking up Onyx Card Controller... Please wait."));
+uint32_t sdWriteFailures = 0;
+uint32_t sdFlushCount = 0;
+
+
+void setupSD() {
+  pinMode(CS_PIN, OUTPUT);
+  digitalWrite(CS_PIN, HIGH);
+
+  Serial.println(F("Initializing SD card..."));
 
   bool cardConnected = false;
   uint8_t retryCount = 0;
   
-  // Ping the Onyx card up to 5 consecutive times to give the controller time to boot
+  // Ping the SD card up to 5 consecutive times to give the controller time to boot
   while (!cardConnected && retryCount < 5) {
-    if (sd.begin(SdSpiConfig(10, SHARED_SPI, SD_SCK_MHZ(1)))) { // Run at stable 1MHz
+    if (sd.begin(SdSpiConfig(CS_PIN, SHARED_SPI, SD_SCK_MHZ(1)))) { // Run at stable 1MHz
       cardConnected = true;
     } else {
       retryCount++;
@@ -52,7 +65,7 @@ volatile uint8_t bufferIndex = 0;
 
   if (!cardConnected) {
     Serial.println(F("\n================================="));
-    Serial.println(F("CRITICAL: Onyx Card completely timed out!"));
+    Serial.println(F("CRITICAL: SD Card completely timed out!"));
     Serial.print(F("SD Error Code: 0x"));
     Serial.println(sd.card()->errorCode(), HEX);
     Serial.println(F("================================="));
@@ -63,8 +76,8 @@ volatile uint8_t bufferIndex = 0;
     Serial.println(F("FATAL: Could not open bin file layer."));
     while (1);
   }
-  Serial.println(F("Onyx SD Card successfully linked and mounted!"));
-}*/
+  Serial.println(F("SD card ready, logging to imu_log.bin"));
+}
 
 
 uint32_t lastTime = 0;
@@ -81,7 +94,13 @@ const float R_measure = 0.0379;
 
 
 ISR(TIMER1_COMPA_vect) {
-  sampleReady = true;
+  uint8_t nextHead = (tickHead + 1) % TICK_QUEUE_SIZE;
+  if (nextHead == tickTail) {
+    missedSamples++;
+    return;
+}
+tickTimestamps[tickHead] = micros();
+  tickHead = nextHead;
 }
 
 void setupTimer() {
@@ -137,17 +156,26 @@ bool readBytes(uint8_t deviceAddr, uint8_t startReg, uint8_t* buffer, uint8_t co
   }
   return true;
 }
-/*void logSample(uint32_t timestamp, int16_t ax, int16_t ay, int16_t az,
-               int16_t gx, int16_t gy, int16_t gz, float p, float r) {
-  sampleBuffer[bufferIndex] = {timestamp, ax, ay, az, gx, gy, gz, (int16_t)(p * 100), (int16_t)(r * 100)};
+void logSample(uint32_t timestamp, int16_t ax, int16_t ay, int16_t az,
+               int16_t gx, int16_t gy, int16_t gz, float p, float r, uint8_t queue_depth) {
+  sampleBuffer[bufferIndex] = {timestamp, ax, ay, az, gx, gy, gz, (int16_t)(p * 100), (int16_t)(r * 100), queue_depth};
   bufferIndex++;
 
   if (bufferIndex >= BUFFER_SIZE) {
-    logFile.write((uint8_t*)sampleBuffer, sizeof(sampleBuffer));
-    logFile.flush();
+    size_t written = logFile.write((uint8_t*)sampleBuffer, sizeof(sampleBuffer));
+    bool flushOk = logFile.sync();  // SdFat: sync() flushes AND checks for errors
+
+    if (written != sizeof(sampleBuffer) || !flushOk) {
+      sdWriteFailures++;
+      // Deliberately not halting — matches D18/D16's philosophy: report,
+      // don't silently normalize, but don't crash a live capture over
+      // one bad write either. sdWriteFailures is checked/printed
+      // periodically below.
+    }
+    sdFlushCount++;
     bufferIndex = 0;
   }
-}*/
+ }
 
 void calibrateGyro(float* biasX, float* biasY, float* biasZ) {
   const int numSamples = 1000;
@@ -219,12 +247,16 @@ void setup() {
   Serial.begin(115200);
   while (!Serial);
 
-    //setupSD();
+  setupSD();
+  Serial.println(F("DEBUG: past setupSD"));
   btSerial.begin(38400);
+  Serial.println(F("DEBUG: past btSerial.begin"));
 
   // --- WHO_AM_I check ---
+  Serial.println(F("DEBUG: about to check WHO_AM_I"));
   uint8_t whoAmI;
   bool whoAmIOk = readRegister(MPU6050_ADDR_AD0_LOW, REG_WHO_AM_I, &whoAmI);
+  Serial.println(F("DEBUG: past WHO_AM_I read"));
 
   if (!whoAmIOk || whoAmI != WHO_AM_I_EXPECTED) {
     Serial.println(F("FATAL: MPU-6050 not responding correctly. Halting."));
@@ -324,20 +356,23 @@ void setup() {
   setupTimer();
 }
 void loop() {
-  if (sampleReady) {
-    sampleReady = false;
+  while (tickTail != tickHead) {
+    // Depth = how many ticks are still waiting behind this one, INCLUDING
+    // this one, computed before tickTail advances. 0 backlog beyond this
+    // sample = depth 1; if depth > 1, this is a catch-up read.
+    uint8_t queueDepth = (tickHead - tickTail + TICK_QUEUE_SIZE) % TICK_QUEUE_SIZE;
+    if (queueDepth == 0) queueDepth = TICK_QUEUE_SIZE;  // wrapped-around full case
+
+    uint32_t tickTime = tickTimestamps[tickTail];
+    tickTail = (tickTail + 1) % TICK_QUEUE_SIZE;
 
     uint32_t now = micros();
-
-  
-
-    uint32_t dt_us = now - lastTime;             // wrap-safe
+    uint32_t dt_us = now - lastTime;
     float dt = dt_us / 1000000.0f;
     lastTime = now;
 
     uint8_t buffer[14];
     bool ok = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
-
 
     if (!ok) {
       Serial.println("Sensor read failed, skipping this cycle");
@@ -356,7 +391,6 @@ void loop() {
     float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
     float gyroX_dps = (gyroX_signed / GYRO_SENSITIVITY_DEFAULT) - biasX;
     float gyroY_dps = (gyroY_signed / GYRO_SENSITIVITY_DEFAULT) - biasY;
-  
 
     float pitch_accel = atan2(accelY_g, accelZ_g) * 180.0 / PI;
     float pitch_gyro  = pitch + gyroX_dps * dt;
@@ -374,19 +408,29 @@ void loop() {
     kalmanAngle += kalmanGain * (pitch_accel - kalmanAngle);
     kalmanUncertainty *= (1 - kalmanGain);
 
-    //logSample(now, accelX_signed, accelY_signed, accelZ_signed, gyroX_signed, gyroY_signed, gyroZ_signed, pitch, roll);
+    logSample(now, accelX_signed, accelY_signed, accelZ_signed,
+              gyroX_signed, gyroY_signed, gyroZ_signed, pitch, roll, queueDepth);
+
     if (++btDownsampleCounter >= BT_DOWNSAMPLE) {
       btDownsampleCounter = 0;
       sendTelemetryBT(now, accelX_signed, accelY_signed, accelZ_signed,
                    gyroX_signed, gyroY_signed, gyroZ_signed, pitch, roll);
-}
-    btSerial.println("BT alive");
+    }
+
     static int printCounter = 0;
     if (++printCounter >= 10) {
       printCounter = 0;
-      Serial.print("Pitch (comp): "); Serial.println(pitch, 2);
-      Serial.print("Kalman Angle: ");  Serial.println(kalmanAngle, 2);
+      //Serial.print("Pitch (comp): "); Serial.println(pitch, 2);
+      //Serial.print("Kalman Angle: ");  Serial.println(kalmanAngle, 2);
+      //Serial.print("SD flushes: "); Serial.print(sdFlushCount);
+      //Serial.print("  failures: "); Serial.println(sdWriteFailures);
+      //Serial.print("Missed samples (true overflow): "); Serial.println(missedSamples);
     }
-    // no delay here — the ISR paces the loop
+static uint32_t lastMissedCheck = 0;
+if (millis() - lastMissedCheck >= 5000) {  // print just this one line, every 5 seconds
+  lastMissedCheck = millis();
+  Serial.print("Missed samples: ");
+  Serial.println(missedSamples);
+}
   }
 }
