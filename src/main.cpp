@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include "mpu6050_registers.h"   // your header from Step 3
+#include "mpu6050_registers.h"
 #include <SoftwareSerial.h>
 #include <SdFat.h>
 
@@ -20,7 +20,7 @@ struct __attribute__((packed)) ImuSample {
   int16_t gx, gy, gz;      // raw sensor units
   int16_t pitch_x100;      // pitch * 100, fixed-point (0.01° resolution)
   int16_t roll_x100;
-  uint8_t queue_depth_at_read;       // roll * 100, fixed-point
+  uint8_t queue_depth_at_read;       // ring-buffer depth observed when this sample was pulled off the queue
 };
 uint8_t btDownsampleCounter = 0;
 const uint8_t BT_DOWNSAMPLE = 5; // send every 5th sample over Bluetooth
@@ -156,6 +156,38 @@ bool readBytes(uint8_t deviceAddr, uint8_t startReg, uint8_t* buffer, uint8_t co
   }
   return true;
 }
+
+// ---- Raw register decoding ----
+// Combines a 14-byte MPU-6050 burst-read buffer (starting at REG_ACCEL_XOUT_H)
+// into signed 16-bit axis values. This exact bit-shift used to be repeated
+// independently in four places (setup() x2, loop(), calibrateGyro(),
+// captureAccelPosition()) and had drifted into slightly different spellings —
+// centralised here so there's one implementation to get right.
+struct RawSample {
+  int16_t accelX, accelY, accelZ;
+  int16_t gyroX, gyroY, gyroZ;
+};
+
+RawSample extractRawSample(const uint8_t* buffer) {
+  RawSample s;
+  s.accelX = (int16_t)((buffer[0] << 8) | buffer[1]);
+  s.accelY = (int16_t)((buffer[2] << 8) | buffer[3]);
+  s.accelZ = (int16_t)((buffer[4] << 8) | buffer[5]);
+  s.gyroX  = (int16_t)((buffer[8] << 8) | buffer[9]);
+  s.gyroY  = (int16_t)((buffer[10] << 8) | buffer[11]);
+  s.gyroZ  = (int16_t)((buffer[12] << 8) | buffer[13]);
+  return s;
+}
+
+// ---- Raw-to-physical-unit conversion ----
+inline float accelToG(int16_t raw, float offset, float scale) {
+  return (raw - offset) / scale;
+}
+
+inline float gyroToDps(int16_t raw, float sensitivity, float bias = 0.0f) {
+  return (raw / sensitivity) - bias;
+}
+
 void logSample(uint32_t timestamp, int16_t ax, int16_t ay, int16_t az,
                int16_t gx, int16_t gy, int16_t gz, float p, float r, uint8_t queue_depth) {
   sampleBuffer[bufferIndex] = {timestamp, ax, ay, az, gx, gy, gz, (int16_t)(p * 100), (int16_t)(r * 100), queue_depth};
@@ -186,13 +218,10 @@ void calibrateGyro(float* biasX, float* biasY, float* biasZ) {
     bool readOk = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
     if (!readOk) continue;
       
-    int16_t gyroX = (int16_t)((buffer[8] << 8) | buffer[9]);
-    int16_t gyroY = (int16_t)((buffer[10] << 8) | buffer[11]);
-    int16_t gyroZ = (int16_t)((buffer[12] << 8) | buffer[13]);
-
-    sumX += gyroX;
-    sumY += gyroY;
-    sumZ += gyroZ;
+    RawSample s = extractRawSample(buffer);
+    sumX += s.gyroX;
+    sumY += s.gyroY;
+    sumZ += s.gyroZ;
     successfulReads++;
     delay(1); // small delay to avoid overwhelming the sensor
   }
@@ -212,9 +241,10 @@ void calibrateGyro(float* biasX, float* biasY, float* biasZ) {
     bool ok = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer, SENSOR_DATA_LENGTH);
     if (!ok) continue;
 
-    sumX += (int16_t)((buffer[0] << 8) | buffer[1]);
-    sumY += (int16_t)((buffer[2] << 8) | buffer[3]);
-    sumZ += (int16_t)((buffer[4] << 8) | buffer[5]);
+    RawSample s = extractRawSample(buffer);
+    sumX += s.accelX;
+    sumY += s.accelY;
+    sumZ += s.accelZ;
     successfulReads++;
 
     delay(2);
@@ -248,15 +278,11 @@ void setup() {
   while (!Serial);
 
   setupSD();
-  Serial.println(F("DEBUG: past setupSD"));
   btSerial.begin(38400);
-  Serial.println(F("DEBUG: past btSerial.begin"));
 
   // --- WHO_AM_I check ---
-  Serial.println(F("DEBUG: about to check WHO_AM_I"));
   uint8_t whoAmI;
   bool whoAmIOk = readRegister(MPU6050_ADDR_AD0_LOW, REG_WHO_AM_I, &whoAmI);
-  Serial.println(F("DEBUG: past WHO_AM_I read"));
 
   if (!whoAmIOk || whoAmI != WHO_AM_I_EXPECTED) {
     Serial.println(F("FATAL: MPU-6050 not responding correctly. Halting."));
@@ -290,30 +316,18 @@ void setup() {
   if (!readOk) {
     Serial.println("Sensor data read failed - skipping this reading.");
   } else {
-    uint16_t accelX_raw = (uint16_t)((buffer[0] << 8) | buffer[1]);
-    uint16_t accelY_raw = (uint16_t)((buffer[2] << 8) | buffer[3]);
-    uint16_t accelZ_raw = (uint16_t)((buffer[4] << 8) | buffer[5]);
-    uint16_t gyroX_raw  = (uint16_t)((buffer[8] << 8) | buffer[9]);
-    uint16_t gyroY_raw  = (uint16_t)((buffer[10] << 8) | buffer[11]);
-    uint16_t gyroZ_raw  = (uint16_t)((buffer[12] << 8) | buffer[13]);
+    RawSample s = extractRawSample(buffer);
 
-    int16_t accelX_signed = (int16_t)accelX_raw;
-    int16_t accelY_signed = (int16_t)accelY_raw;
-    int16_t accelZ_signed = (int16_t)accelZ_raw;
-    int16_t gyroX_signed  = (int16_t)gyroX_raw;
-    int16_t gyroY_signed  = (int16_t)gyroY_raw;
-    int16_t gyroZ_signed  = (int16_t)gyroZ_raw;
+    Serial.print("ACCEL_X_SIGNED: "); Serial.println(s.accelX);
+    Serial.print("ACCEL_Y_SIGNED: "); Serial.println(s.accelY);
+    Serial.print("ACCEL_Z_SIGNED: "); Serial.println(s.accelZ);
+    Serial.print("GYRO_X_SIGNED: ");  Serial.println(s.gyroX);
+    Serial.print("GYRO_Y_SIGNED: ");  Serial.println(s.gyroY);
+    Serial.print("GYRO_Z_SIGNED: ");  Serial.println(s.gyroZ);
 
-    Serial.print("ACCEL_X_SIGNED: "); Serial.println(accelX_signed);
-    Serial.print("ACCEL_Y_SIGNED: "); Serial.println(accelY_signed);
-    Serial.print("ACCEL_Z_SIGNED: "); Serial.println(accelZ_signed);
-    Serial.print("GYRO_X_SIGNED: ");  Serial.println(gyroX_signed);
-    Serial.print("GYRO_Y_SIGNED: ");  Serial.println(gyroY_signed);
-    Serial.print("GYRO_Z_SIGNED: ");  Serial.println(gyroZ_signed);
-
-    float accelX_g = (accelX_signed - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
-    float accelY_g = (accelY_signed - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
-    float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
+    float accelX_g = accelToG(s.accelX, ACCEL_OFFSET_X, ACCEL_SCALE_X);
+    float accelY_g = accelToG(s.accelY, ACCEL_OFFSET_Y, ACCEL_SCALE_Y);
+    float accelZ_g = accelToG(s.accelZ, ACCEL_OFFSET_Z, ACCEL_SCALE_Z);
     float magnitude = sqrt(accelX_g*accelX_g + accelY_g*accelY_g + accelZ_g*accelZ_g);
 
     Serial.print("MAGNITUDE (calibrated, should be ~1.0g): ");
@@ -328,17 +342,15 @@ void setup() {
   uint8_t buffer2[14];
   bool readOk2 = readBytes(MPU6050_ADDR_AD0_LOW, REG_ACCEL_XOUT_H, buffer2, SENSOR_DATA_LENGTH);
   if (readOk2) {
-    int16_t gyroX_signed = (int16_t)((buffer2[8] << 8) | buffer2[9]);
-    int16_t gyroY_signed = (int16_t)((buffer2[10] << 8) | buffer2[11]);
-    int16_t gyroZ_signed = (int16_t)((buffer2[12] << 8) | buffer2[13]);
+    RawSample s2 = extractRawSample(buffer2);
 
-    float gyroX_dps_raw = gyroX_signed / GYRO_SENSITIVITY_DEFAULT;
-    float gyroY_dps_raw = gyroY_signed / GYRO_SENSITIVITY_DEFAULT;
-    float gyroZ_dps_raw = gyroZ_signed / GYRO_SENSITIVITY_DEFAULT;
+    float gyroX_dps_raw = gyroToDps(s2.gyroX, GYRO_SENSITIVITY_DEFAULT);
+    float gyroY_dps_raw = gyroToDps(s2.gyroY, GYRO_SENSITIVITY_DEFAULT);
+    float gyroZ_dps_raw = gyroToDps(s2.gyroZ, GYRO_SENSITIVITY_DEFAULT);
 
-    float gyroX_dps_corrected = gyroX_dps_raw - biasX;
-    float gyroY_dps_corrected = gyroY_dps_raw - biasY;
-    float gyroZ_dps_corrected = gyroZ_dps_raw - biasZ;
+    float gyroX_dps_corrected = gyroToDps(s2.gyroX, GYRO_SENSITIVITY_DEFAULT, biasX);
+    float gyroY_dps_corrected = gyroToDps(s2.gyroY, GYRO_SENSITIVITY_DEFAULT, biasY);
+    float gyroZ_dps_corrected = gyroToDps(s2.gyroZ, GYRO_SENSITIVITY_DEFAULT, biasZ);
 
     Serial.print("Gyro X — raw: "); Serial.print(gyroX_dps_raw, 3);
     Serial.print("  corrected: "); Serial.println(gyroX_dps_corrected, 3);
@@ -349,8 +361,6 @@ void setup() {
     Serial.print("Gyro Z — raw: "); Serial.print(gyroZ_dps_raw, 3);
     Serial.print("  corrected: "); Serial.println(gyroZ_dps_corrected, 3);
 }
-  int16_t x1, y1, z1;
-  captureAccelPosition("side (x up)", &x1, &y1, &z1);
 
   lastTime = micros();
   setupTimer();
@@ -379,18 +389,19 @@ void loop() {
       return;
     }
 
-    int16_t accelX_signed = (int16_t)((buffer[0] << 8) | buffer[1]);
-    int16_t accelY_signed = (int16_t)((buffer[2] << 8) | buffer[3]);
-    int16_t accelZ_signed = (int16_t)((buffer[4] << 8) | buffer[5]);
-    int16_t gyroX_signed  = (int16_t)((buffer[8] << 8) | buffer[9]);
-    int16_t gyroY_signed  = (int16_t)((buffer[10] << 8) | buffer[11]);
-    int16_t gyroZ_signed  = (int16_t)((buffer[12] << 8) | buffer[13]);
+    RawSample s = extractRawSample(buffer);
+    int16_t accelX_signed = s.accelX;
+    int16_t accelY_signed = s.accelY;
+    int16_t accelZ_signed = s.accelZ;
+    int16_t gyroX_signed  = s.gyroX;
+    int16_t gyroY_signed  = s.gyroY;
+    int16_t gyroZ_signed  = s.gyroZ;
 
-    float accelX_g = (accelX_signed - ACCEL_OFFSET_X) / ACCEL_SCALE_X;
-    float accelY_g = (accelY_signed - ACCEL_OFFSET_Y) / ACCEL_SCALE_Y;
-    float accelZ_g = (accelZ_signed - ACCEL_OFFSET_Z) / ACCEL_SCALE_Z;
-    float gyroX_dps = (gyroX_signed / GYRO_SENSITIVITY_DEFAULT) - biasX;
-    float gyroY_dps = (gyroY_signed / GYRO_SENSITIVITY_DEFAULT) - biasY;
+    float accelX_g = accelToG(accelX_signed, ACCEL_OFFSET_X, ACCEL_SCALE_X);
+    float accelY_g = accelToG(accelY_signed, ACCEL_OFFSET_Y, ACCEL_SCALE_Y);
+    float accelZ_g = accelToG(accelZ_signed, ACCEL_OFFSET_Z, ACCEL_SCALE_Z);
+    float gyroX_dps = gyroToDps(gyroX_signed, GYRO_SENSITIVITY_DEFAULT, biasX);
+    float gyroY_dps = gyroToDps(gyroY_signed, GYRO_SENSITIVITY_DEFAULT, biasY);
 
     float pitch_accel = atan2(accelY_g, accelZ_g) * 180.0 / PI;
     float pitch_gyro  = pitch + gyroX_dps * dt;
@@ -417,20 +428,17 @@ void loop() {
                    gyroX_signed, gyroY_signed, gyroZ_signed, pitch, roll);
     }
 
-    static int printCounter = 0;
-    if (++printCounter >= 10) {
-      printCounter = 0;
-      //Serial.print("Pitch (comp): "); Serial.println(pitch, 2);
-      //Serial.print("Kalman Angle: ");  Serial.println(kalmanAngle, 2);
-      //Serial.print("SD flushes: "); Serial.print(sdFlushCount);
-      //Serial.print("  failures: "); Serial.println(sdWriteFailures);
-      //Serial.print("Missed samples (true overflow): "); Serial.println(missedSamples);
+    // Single periodic status line — always on, no debug flag required.
+    // 5s interval keeps this readable at 100Hz sample rate without flooding
+    // the monitor.
+    static uint32_t lastStatusPrint = 0;
+    if (millis() - lastStatusPrint >= 5000) {
+      lastStatusPrint = millis();
+      Serial.print(F("Pitch (comp): "));      Serial.print(pitch, 2);
+      Serial.print(F("  Kalman: "));          Serial.print(kalmanAngle, 2);
+      Serial.print(F("  SD flushes: "));      Serial.print(sdFlushCount);
+      Serial.print(F("  SD failures: "));     Serial.print(sdWriteFailures);
+      Serial.print(F("  Missed samples: "));  Serial.println(missedSamples);
     }
-static uint32_t lastMissedCheck = 0;
-if (millis() - lastMissedCheck >= 5000) {  // print just this one line, every 5 seconds
-  lastMissedCheck = millis();
-  Serial.print("Missed samples: ");
-  Serial.println(missedSamples);
-}
   }
 }
