@@ -1,4 +1,4 @@
-# IMU Project — Measured Results
+# IMU Project — Measured Results & CV Claims Log
 
 
 ## Gyroscope calibration (Step 9)
@@ -456,13 +456,13 @@ limitation) rather than pursued further this session.
 **SD card debugging:** extensive troubleshooting of intermittent SD
 logging failures concluded the root cause was the card itself — an
 off-brand Onyx microSD, known for inconsistent SPI timing/write
-behaviour under embedded use. SanDisk replacement ordered; SD logging
-work paused pending its arrival rather than continuing to debug against
-unreliable hardware.
+behaviour under embedded use. Replaced with a SanDisk card, which
+resolved the intermittent failures; full logging work (buffered writes,
+flush confirmation, verification script, the 27,000-sample steady-state
+run) completed on the SanDisk card — see the SD card logging (Step 12)
+section above for results.
 
-**Remaining components not yet wired:** SD card module (blocked on
-replacement card, see above), HC-05 Bluetooth, 2x MCP2515 CAN modules —
-planned for Step 12 (logging/telemetry) and Step 15 (CAN bus)
-respectively.
+**Remaining components not yet wired:** 2x MCP2515 CAN modules — planned
+for Step 15 (CAN bus).
 
 ---
